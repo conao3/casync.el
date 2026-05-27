@@ -36,6 +36,63 @@ Sample install code using [[https://github.com/conao3/leaf.el][leaf.el]].
 #+end_src
 
 * Usage
+casync brings clojure.core.async style CSP to Emacs Lisp: channels, ~go~
+blocks with parking operations, ~alts!~, timeouts and the usual pipeline
+combinators.  Emacs Lisp runs cooperatively on a single thread, so ~go~
+blocks are coroutines (built on [[https://github.com/doublep/iter2][iter2]]) driven by a timer based
+scheduler, and the blocking operations pump that scheduler.  Genuine
+parallelism is available through ~casync-thread~, which offloads a
+self-contained computation to a child Emacs process via [[https://github.com/jwiegley/emacs-async][emacs-async]].
+
+Files that use ~casync-go~ must enable lexical binding.
+
+#+begin_src emacs-lisp
+  ;; -*- lexical-binding: t; -*-
+  (require 'casync)
+
+  ;; A buffered channel, a producer and a consumer.
+  (let ((c (casync-chan 1)))
+    (casync-go (casync->! c 42))
+    (casync-<!! (casync-go (casync-<! c))))   ;=> 42
+
+  ;; Pipeline combinators.
+  (casync-<!! (casync-into nil (casync-to-chan! '(1 1 2 3 3))))   ;=> (1 1 2 3 3)
+  (casync-<!! (casync-into nil (casync-unique (casync-to-chan! '(1 1 2 3 3)))))   ;=> (1 2 3 4)
+
+  ;; Select among operations.
+  (casync-<!! (casync-go (casync-alts! (list (casync-timeout 100)) :default :none)))   ;=> (:none :default)
+
+  ;; Offload a self-contained computation to a child Emacs.
+  (casync-<!! (casync-thread (+ 2 40)))   ;=> 42
+#+end_src
+
+** API correspondence
+All public symbols carry the ~casync-~ prefix.
+
+| clojure.core.async                         | casync                                             |
+|--------------------------------------------+----------------------------------------------------|
+| ~chan~ ~promise-chan~ ~timeout~            | ~casync-chan~ ~casync-promise-chan~ ~casync-timeout~ |
+| ~go~ ~go-loop~ ~recur~ ~thread~            | ~casync-go~ ~casync-go-loop~ ~casync-recur~ ~casync-thread~ |
+| ~<!~ ~>!~ ~<!!~ ~>!!~                       | ~casync-<!~ ~casync->!~ ~casync-<!!~ ~casync->!!~   |
+| ~put!~ ~take!~ ~close!~ ~offer!~ ~poll!~   | ~casync-put!~ ~casync-take!~ ~casync-close!~ ~casync-offer!~ ~casync-poll!~ |
+| ~alts!~ ~alt!~ ~alts!!~ ~alt!!~            | ~casync-alts!~ ~casync-alt!~ ~casync-alts!!~ ~casync-alt!!~ |
+| ~buffer~ ~dropping-buffer~ ~sliding-buffer~ | ~casync-buffer~ ~casync-dropping-buffer~ ~casync-sliding-buffer~ |
+| ~pipe~ ~merge~ ~mult~/~tap~ ~mix~/~admix~  | ~casync-pipe~ ~casync-merge~ ~casync-mult~/~casync-tap~ ~casync-mix~/~casync-admix~ |
+| ~pub~/~sub~ ~split~ ~reduce~ ~into~        | ~casync-pub~/~casync-sub~ ~casync-split~ ~casync-reduce~ ~casync-into~ |
+| ~onto-chan!~ ~to-chan!~ ~take~ ~unique~    | ~casync-onto-chan!~ ~casync-to-chan!~ ~casync-take~ ~casync-unique~ |
+| ~partition~ ~partition-by~ ~pipeline-async~ | ~casync-partition~ ~casync-partition-by~ ~casync-pipeline-async~ |
+
+** Differences from clojure.core.async
+- Parking operations (~casync-<!~, ~casync->!~, ~casync-alts!~) are valid
+  only directly inside a ~casync-go~ body; they cannot park inside a nested
+  lambda or an ~unwind-protect~ cleanup form.
+- ~casync-<!!~ / ~casync->!!~ drive the scheduler instead of blocking a
+  thread, and are valid only at top level (not inside a ~go~ block or a
+  scheduler callback).
+- ~casync-thread~ runs a self-contained body in a child Emacs process; the
+  body cannot share channels, closures, or dynamic bindings with the parent
+  and must return a single serializable value.
+- Transducer-aware channels (~(chan n xf)~) are not provided.
 
 * Customize
 

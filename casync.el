@@ -51,7 +51,7 @@
 
 
 (defun casync-buffer (n)
-  "Return a fixed buffer that holds up to N items."
+  "Return a fixed buffer with capacity N."
   (list 'casync--fixed :items nil :n n))
 
 (defun casync-dropping-buffer (n)
@@ -92,7 +92,7 @@
   (pcase (car buffer)
     ('casync--fixed
      (when (casync-buffer-full-p buffer)
-       (error "casync-buffer-add!: buffer full"))
+       (error "Buffer is full"))
      (casync--set buffer :items (append (casync--get buffer :items) (list item))))
     ('casync--dropping
      (when (< (length (casync--get buffer :items)) (casync--get buffer :n))
@@ -113,7 +113,7 @@
       (casync--get buffer :value)
     (let ((items (casync--get buffer :items)))
       (when (null items)
-        (error "casync-buffer-remove!: buffer empty"))
+        (error "Buffer is empty"))
       (casync--set buffer :items (cdr items))
       (car items))))
 
@@ -146,7 +146,7 @@ The argument is the error object as produced by `condition-case'.")
 
 (defun casync--default-error-handler (err)
   "Report ERR by logging it."
-  (message "casync: unhandled error: %S" err))
+  (message "Unhandled casync error: %S" err))
 
 (defun casync--enqueue (thunk)
   "Append THUNK to the run queue."
@@ -193,14 +193,14 @@ The argument is the error object as produced by `condition-case'.")
       (casync--run-one thunk))))
 
 (defun casync--pump (donep &optional timeout)
-  "Drive the scheduler until DONEP returns non-nil.
+  "Drive the scheduler until DONEP is non-nil.
 TIMEOUT, when non-nil, is the maximum number of seconds to wait.
 Signal an error when called from within the scheduler or a go block,
 when TIMEOUT elapses, or when no progress can be made."
   (when casync--draining
-    (error "casync: blocking operation called inside scheduler"))
+    (error "Blocking operation called inside scheduler"))
   (when casync--in-go
-    (error "casync: blocking operation called inside go block"))
+    (error "Blocking operation called inside go block"))
   (let ((deadline (and timeout (+ (float-time) timeout))))
     (catch 'casync--pump-done
       (while t
@@ -208,10 +208,10 @@ when TIMEOUT elapses, or when no progress can be made."
         (when (funcall donep)
           (throw 'casync--pump-done t))
         (when (and deadline (> (float-time) deadline))
-          (error "casync: pump timeout"))
+          (error "Pump timed out"))
         (if (> casync--external-pending 0)
             (accept-process-output nil 0.05)
-          (error "casync: deadlock, no pending work"))))))
+          (error "Deadlock: no pending work"))))))
 
 
 (defconst casync--max-queue-size 1024
@@ -244,9 +244,9 @@ fixed buffer of that size, or a buffer object."
               ((integerp buffer)
                (if (> buffer 0)
                    (casync-buffer buffer)
-                 (error "casync-chan: buffer size must be positive")))
+                 (error "Buffer size must be positive")))
               ((casync--buffer-p buffer) buffer)
-              (t (error "casync-chan: invalid buffer %S" buffer)))
+              (t (error "Invalid buffer: %S" buffer)))
         :takes nil
         :puts nil
         :closed nil))
@@ -348,7 +348,7 @@ When ENQUEUE is non-nil and the take cannot complete, park HANDLER."
                            (cl-delete-if-not #'casync--handler-active-p
                                              (casync--get ch :takes)))
               (when (>= (length (casync--get ch :takes)) casync--max-queue-size)
-                (error "casync: too many pending takes"))
+                (error "Too many pending takes"))
               (casync--set ch :takes
                            (nconc (casync--get ch :takes) (list handler))))
             nil)
@@ -359,7 +359,7 @@ When ENQUEUE is non-nil and the take cannot complete, park HANDLER."
 Return a box when the put completes, or nil when it parks.
 When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
   (when (null val)
-    (error "casync: cannot put nil on a channel"))
+    (error "Cannot put nil on a channel"))
   (when (casync--handler-active-p handler)
     (cond
      ((casync--get ch :closed)
@@ -388,7 +388,7 @@ When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
                               (lambda (p) (casync--handler-active-p (cdr p)))
                               (casync--get ch :puts)))
                 (when (>= (length (casync--get ch :puts)) casync--max-queue-size)
-                  (error "casync: too many pending puts"))
+                  (error "Too many pending puts"))
                 (casync--set ch :puts
                              (nconc (casync--get ch :puts) (list (cons val handler)))))
               nil)
@@ -517,9 +517,7 @@ binding values; any other value finishes the loop and is delivered."
   "Run BODY asynchronously as a go block.
 Return a channel that yields BODY's value and then closes."
   (declare (indent 0))
-  `(casync--run-go (iter2-lambda () ,@body)))
-
-)
+  `(casync--run-go (iter2-lambda () ,@body))))
 
 (defun casync--run-go (machine)
   "Start go MACHINE and return its result channel."
@@ -535,7 +533,8 @@ Return a channel that yields BODY's value and then closes."
   (casync-close! result-ch))
 
 (defun casync--go-resume (it result-ch value)
-  "Resume go iterator IT with VALUE, dispatching its next park request."
+  "Resume go iterator IT with VALUE and dispatch its next park request.
+RESULT-CH receives IT's final result."
   (let ((request
          (condition-case err
              (let ((casync--in-go t))
@@ -559,7 +558,7 @@ Return a channel that yields BODY's value and then closes."
      (casync-put! ch val (lambda (ret) (casync--go-resume it result-ch ret))))
     (`(:alts ,ops ,opts)
      (casync--alts ops opts (lambda (result) (casync--go-resume it result-ch result))))
-    (_ (error "casync: unknown park request %S" request))))
+    (_ (error "Unknown park request: %S" request))))
 
 
 (defun casync--shuffle (list)
@@ -735,7 +734,7 @@ Each clause is PORT followed by (BINDINGS BODY...), or `:default EXPR'."
   (list 'casync--reduced :value value))
 
 (defun casync-reduced-p (object)
-  "Return non-nil when OBJECT marks an early reduction result."
+  "Return non-nil when OBJECT is an early reduction result."
   (eq (car-safe object) 'casync--reduced))
 
 (defun casync--reduced-value (object)
@@ -861,7 +860,7 @@ A trailing partial group is delivered.  BUFFER is passed to `casync-chan'."
     out))
 
 (cl-defun casync-partition-by (f ch &optional buffer)
-  "Return a channel of groups of values from CH split when (F value) changes.
+  "Return a channel of groups of consecutive values from CH with equal (F value).
 BUFFER is passed to `casync-chan'."
   (let ((out (casync-chan buffer)))
     (casync-go-loop ((batch nil) (last 'casync--none))
