@@ -1,0 +1,9 @@
+;; Keg
+
+(source gnu melpa)
+
+(package
+ (casync
+  (recipe . (casync :fetcher github :repo "conao3/casync.el"))))
+
+(dev-dependency cort)
