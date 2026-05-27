@@ -29,6 +29,8 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'generator)
+(require 'iter2)
 
 (defgroup casync nil
   "Elisp port of clojure.core.async."
@@ -499,6 +501,61 @@ Return t on success or nil when CH is closed."
     (casync-put! ch val (lambda (r) (setq result r got t)))
     (casync--pump (lambda () got))
     result))
+
+
+(defmacro casync-<! (ch)
+  "Park the current go block until a value is taken from CH.
+Valid only inside the body of `casync-go'."
+  `(iter-yield (list :take ,ch)))
+
+(defmacro casync->! (ch val)
+  "Park the current go block until VAL is put on CH.
+Valid only inside the body of `casync-go'."
+  `(iter-yield (list :put ,ch ,val)))
+
+(defmacro casync-go (&rest body)
+  "Run BODY asynchronously as a go block.
+Return a channel that yields BODY's value and then closes."
+  (declare (indent 0))
+  `(casync--run-go (iter2-lambda () ,@body)))
+
+(defun casync--run-go (machine)
+  "Start go MACHINE and return its result channel."
+  (let ((it (funcall machine))
+        (result-ch (casync-chan 1)))
+    (casync--dispatch (lambda () (casync--go-resume it result-ch nil)))
+    result-ch))
+
+(defun casync--deliver-go-result (result-ch value)
+  "Deliver VALUE on RESULT-CH and close it."
+  (when (not (null value))
+    (casync-put! result-ch value #'ignore))
+  (casync-close! result-ch))
+
+(defun casync--go-resume (it result-ch value)
+  "Resume go iterator IT with VALUE, dispatching its next park request."
+  (let ((request
+         (condition-case err
+             (let ((casync--in-go t))
+               (cons 'request (iter2-next it value)))
+           (iter-end-of-sequence
+            (casync--deliver-go-result result-ch (cdr err))
+            nil)
+           (error
+            (casync-close! result-ch)
+            (funcall casync-error-handler err)
+            nil))))
+    (when request
+      (casync--go-dispatch-request it result-ch (cdr request)))))
+
+(defun casync--go-dispatch-request (it result-ch request)
+  "Perform park REQUEST for go iterator IT bound to RESULT-CH."
+  (pcase request
+    (`(:take ,ch)
+     (casync-take! ch (lambda (v) (casync--go-resume it result-ch v))))
+    (`(:put ,ch ,val)
+     (casync-put! ch val (lambda (ret) (casync--go-resume it result-ch ret))))
+    (_ (error "casync: unknown park request %S" request))))
 
 (provide 'casync)
 

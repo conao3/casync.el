@@ -37,6 +37,16 @@
          (casync--timer nil))
      ,@body))
 
+(defmacro casync-deftest-thunk (name op expect &rest body)
+  "Define cort test NAME comparing the result of BODY to EXPECT with OP.
+BODY runs inside a lexically-compiled function so that `casync-go'
+expands correctly, and with a fresh scheduler state."
+  (declare (indent 3))
+  (let ((fn (intern (concat "casync-test--" (symbol-name name)))))
+    `(progn
+       (defun ,fn () (casync-test-fresh ,@body))
+       (cort-deftest ,name '((,op (,fn) ,expect))))))
+
 
 (cort-deftest casync-scheduler/fifo-order
   '((:equal
@@ -191,6 +201,86 @@
             (casync--pump (lambda () (not (eq result :none))))
             result))
          nil)))
+
+
+(casync-deftest-thunk casync-go/returns-value := 10
+  (let ((c (casync-chan 1)))
+    (casync->!! c 10)
+    (casync-<!! (casync-go (casync-<! c)))))
+
+(casync-deftest-thunk casync-go/writes-work := 11
+  (casync-<!! (casync-go
+               (let ((c (casync-chan 1)))
+                 (casync->! c 11)
+                 (casync-<! c)))))
+
+(casync-deftest-thunk casync-go/nil-result :eq nil
+  (casync-<!! (casync-go nil)))
+
+(casync-deftest-thunk casync-go/take-in-let-binding := 42
+  (let ((c (casync-chan 1)))
+    (casync->!! c 42)
+    (casync-<!! (casync-go (let ((x (casync-<! c))) x)))))
+
+(casync-deftest-thunk casync-go/park-across-if :eq :yes
+  (let ((c (casync-chan 1)))
+    (casync->!! c t)
+    (casync-<!! (casync-go (if (casync-<! c) :yes :no)))))
+
+(casync-deftest-thunk casync-go/park-across-while :equal '(1 2 3)
+  (let ((c (casync-chan 5)))
+    (dolist (x '(1 2 3)) (casync->!! c x))
+    (casync-close! c)
+    (casync-<!! (casync-go
+                 (let ((acc nil) (v nil))
+                   (while (setq v (casync-<! c))
+                     (push v acc))
+                   (nreverse acc))))))
+
+(casync-deftest-thunk casync-go/park-across-condition-case := 42
+  (let ((c (casync-chan 1)))
+    (casync->!! c 42)
+    (casync-<!! (casync-go
+                 (condition-case _e (casync-<! c) (error :err))))))
+
+(casync-deftest-thunk casync-go/nests := 23
+  (casync-<!! (casync-<!! (casync-go (casync-go 23)))))
+
+(casync-deftest-thunk casync-go/body-error-routed-to-handler :eq 'error
+  (let ((captured nil))
+    (let ((casync-error-handler (lambda (e) (setq captured e))))
+      (casync-go (error "boom"))
+      (casync--pump (lambda () captured)))
+    (car captured)))
+
+(casync-deftest-thunk casync-go/body-error-closes-result :eq nil
+  (let ((casync-error-handler #'ignore))
+    (casync-<!! (casync-go (error "boom")))))
+
+(casync-deftest-thunk casync-go/blocking-take-inside-go-errors :eq 'error
+  (let ((captured nil))
+    (let ((casync-error-handler (lambda (e) (setq captured (car e)))))
+      (casync-go (casync-<!! (casync-chan)))
+      (casync--pump (lambda () captured)))
+    captured))
+
+(casync-deftest-thunk casync-go/nested-lambda-park-errors :eq t
+  (let ((captured nil))
+    (let ((casync-error-handler (lambda (_e) (setq captured t))))
+      (casync-go (mapcar (lambda (_x) (casync-<! (casync-chan))) '(1)))
+      (casync--pump (lambda () captured)))
+    captured))
+
+(cort-deftest casync-go/park-outside-go-errors
+  '((:cort-error error
+     (casync-<! (casync-chan)))))
+
+(cort-deftest casync-go/park-in-cleanup-rejected
+  '((:cort-error error
+     (eval '(casync-go
+             (unwind-protect (casync-<! (casync-chan))
+               (casync-<! (casync-chan))))
+           t))))
 
 
 (cort-deftest casync-buffer/fixed
