@@ -179,6 +179,98 @@
 
 (cl-defmethod casync-buffer-close! ((_buffer casync--abuf)) nil)
 
+
+(defvar casync-error-handler #'casync--default-error-handler
+  "Function called with one argument when an unhandled error escapes.
+The argument is the error object as produced by `condition-case'.")
+
+(defvar casync--run-queue nil
+  "FIFO list of pending thunks; the head is the next to run.")
+
+(defvar casync--run-queue-tail nil
+  "Last cons of `casync--run-queue' for constant-time enqueue.")
+
+(defvar casync--draining nil
+  "Non-nil while `casync--run-pending' is draining the run queue.")
+
+(defvar casync--in-go nil
+  "Non-nil while executing inside a go block body.")
+
+(defvar casync--timer nil
+  "Pending timer that will drain the run queue, or nil.")
+
+(defvar casync--external-pending 0
+  "Count of outstanding timer or process operations the pump must await.")
+
+(defun casync--default-error-handler (err)
+  "Report ERR by logging it."
+  (message "casync: unhandled error: %S" err))
+
+(defun casync--enqueue (thunk)
+  "Append THUNK to the run queue."
+  (let ((cell (list thunk)))
+    (if casync--run-queue-tail
+        (setcdr casync--run-queue-tail cell)
+      (setq casync--run-queue cell))
+    (setq casync--run-queue-tail cell)))
+
+(defun casync--dequeue ()
+  "Remove and return the next thunk from the run queue, or nil."
+  (when casync--run-queue
+    (prog1 (car casync--run-queue)
+      (setq casync--run-queue (cdr casync--run-queue))
+      (unless casync--run-queue
+        (setq casync--run-queue-tail nil)))))
+
+(defun casync--ensure-timer ()
+  "Schedule a drain of the run queue unless one is already pending."
+  (unless (or casync--draining casync--timer)
+    (setq casync--timer (run-at-time 0 nil #'casync--drain-timer))))
+
+(defun casync--drain-timer ()
+  "Timer callback that drains the run queue."
+  (setq casync--timer nil)
+  (casync--run-pending))
+
+(defun casync--dispatch (thunk)
+  "Schedule THUNK to run on the scheduler."
+  (casync--enqueue thunk)
+  (casync--ensure-timer))
+
+(defun casync--run-one (thunk)
+  "Run THUNK, routing any error to `casync-error-handler'."
+  (condition-case err
+      (funcall thunk)
+    (error (funcall casync-error-handler err))))
+
+(defun casync--run-pending ()
+  "Drain the run queue, running each pending thunk in order."
+  (let ((casync--draining t)
+        (thunk nil))
+    (while (setq thunk (casync--dequeue))
+      (casync--run-one thunk))))
+
+(defun casync--pump (donep &optional timeout)
+  "Drive the scheduler until DONEP returns non-nil.
+TIMEOUT, when non-nil, is the maximum number of seconds to wait.
+Signal an error when called from within the scheduler or a go block,
+when TIMEOUT elapses, or when no progress can be made."
+  (when casync--draining
+    (error "casync: blocking operation called inside scheduler"))
+  (when casync--in-go
+    (error "casync: blocking operation called inside go block"))
+  (let ((deadline (and timeout (+ (float-time) timeout))))
+    (catch 'casync--pump-done
+      (while t
+        (casync--run-pending)
+        (when (funcall donep)
+          (throw 'casync--pump-done t))
+        (when (and deadline (> (float-time) deadline))
+          (error "casync: pump timeout"))
+        (if (> casync--external-pending 0)
+            (accept-process-output nil 0.05)
+          (error "casync: deadlock, no pending work"))))))
+
 (provide 'casync)
 
 ;;; casync.el ends here
