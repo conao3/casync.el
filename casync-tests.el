@@ -271,6 +271,44 @@ expands correctly, and with a fresh scheduler state."
       (casync--pump (lambda () captured)))
     captured))
 
+(casync-deftest-thunk casync-promise-chan/fulfills-pending-takers :equal '(:val :val)
+  (let ((c (casync-promise-chan)) (r1 :none) (r2 :none))
+    (casync-take! c (lambda (v) (setq r1 v)))
+    (casync-take! c (lambda (v) (setq r2 v)))
+    (casync->!! c :val)
+    (list r1 r2)))
+
+(casync-deftest-thunk casync-promise-chan/later-puts-dropped :eq :val
+  (let ((c (casync-promise-chan)))
+    (casync->!! c :val)
+    (casync->!! c :LOST)
+    (casync-<!! c)))
+
+(casync-deftest-thunk casync-promise-chan/takes-keep-returning-value :equal '(:val :val :val)
+  (let ((c (casync-promise-chan)))
+    (casync->!! c :val)
+    (list (casync-<!! c) (casync-<!! c) (casync-<!! c))))
+
+(casync-deftest-thunk casync-promise-chan/close-after-value-keeps-value :equal '(:val :val)
+  (let ((c (casync-promise-chan)))
+    (casync->!! c :val)
+    (casync-close! c)
+    (list (casync-<!! c) (casync-<!! c))))
+
+(casync-deftest-thunk casync-promise-chan/close-before-value-pending-takers-nil :equal '(nil nil)
+  (let ((c (casync-promise-chan)) (r1 :none) (r2 :none))
+    (casync-take! c (lambda (v) (setq r1 v)))
+    (casync-take! c (lambda (v) (setq r2 v)))
+    (casync-close! c)
+    (casync--pump (lambda () (and (not (eq r1 :none)) (not (eq r2 :none)))))
+    (list r1 r2)))
+
+(casync-deftest-thunk casync-promise-chan/close-before-value-takes-nil :eq nil
+  (let ((c (casync-promise-chan)))
+    (casync-close! c)
+    (casync-<!! c)))
+
+
 (cort-deftest casync-go/park-outside-go-errors
   '((:cort-error error
      (casync-<! (casync-chan)))))

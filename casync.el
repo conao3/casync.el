@@ -315,6 +315,10 @@ fixed buffer of that size, or a buffer object."
          ((casync--abuf-p buffer) buffer)
          (t (error "casync-chan: invalid buffer %S" buffer)))))
 
+(defun casync-promise-chan ()
+  "Return a promise channel delivering at most one value to all takers."
+  (casync--make-channel :buf (casync-promise-buffer)))
+
 (defun casync--box (val)
   "Wrap VAL as a completed-operation box."
   (cons 'casync--box val))
