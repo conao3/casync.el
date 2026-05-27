@@ -40,7 +40,7 @@ lint:
 	keg lint
 
 test: build
-	keg exec $(EMACS) --batch -l $(PACKAGE_NAME)-tests.el -f cort-test-run
+	keg exec $(EMACS) -Q --batch -l $(PACKAGE_NAME)-tests.el -f cort-test-run
 
 clean:
 	keg clean

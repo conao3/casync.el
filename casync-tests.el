@@ -22,11 +22,91 @@
 
 ;; Test definitions for `casync'.
 
-
+
 ;;; Code:
 
 (require 'cort)
 (require 'casync)
+
+
+(cort-deftest casync-buffer/fixed
+  '((:equal
+     (let ((b (casync-buffer 2)) (log '()))
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :1)
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :2)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-full-p b) log)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-count b) log)
+       (nreverse log))
+     '(0 1 2 :1 nil 1 :2 0))
+    (:eq (casync-unblocking-buffer-p (casync-buffer 1)) nil)))
+
+(cort-deftest casync-buffer/fixed-remove-empty-errors
+  '((:cort-error error
+     (casync-buffer-remove! (casync-buffer 2)))))
+
+(cort-deftest casync-buffer/dropping
+  '((:equal
+     (let ((b (casync-dropping-buffer 2)) (log '()))
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :1)
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :2)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-full-p b) log)
+       (casync-buffer-add! b :3)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-count b) log)
+       (nreverse log))
+     '(0 1 2 nil 2 :1 1 :2 0))
+    (:eq (casync-unblocking-buffer-p (casync-dropping-buffer 1)) t)))
+
+(cort-deftest casync-buffer/sliding
+  '((:equal
+     (let ((b (casync-sliding-buffer 2)) (log '()))
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :1)
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :2)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-full-p b) log)
+       (casync-buffer-add! b :3)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-count b) log)
+       (nreverse log))
+     '(0 1 2 nil 2 :2 1 :3 0))
+    (:eq (casync-unblocking-buffer-p (casync-sliding-buffer 1)) t)))
+
+(cort-deftest casync-buffer/promise
+  '((:equal
+     (let ((b (casync-promise-buffer)) (log '()))
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :1)
+       (push (casync-buffer-count b) log)
+       (casync-buffer-add! b :2)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-full-p b) log)
+       (casync-buffer-add! b :3)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-count b) log)
+       (push (casync-buffer-remove! b) log)
+       (push (casync-buffer-close! b) log)
+       (push (casync-buffer-remove! b) log)
+       (nreverse log))
+     '(0 1 1 nil 1 :1 1 :1 nil :1))
+    (:eq (casync-unblocking-buffer-p (casync-promise-buffer)) t)))
 
 
 ;; (provide 'casync-tests)
