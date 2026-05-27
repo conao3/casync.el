@@ -34,7 +34,9 @@
   `(let ((casync--run-queue nil)
          (casync--run-queue-tail nil)
          (casync--external-pending 0)
-         (casync--timer nil))
+         (casync--timer nil)
+         (casync--timeouts nil)
+         (casync--timeout-timer nil))
      ,@body))
 
 (defmacro casync-deftest-thunk (name op expect &rest body)
@@ -361,6 +363,33 @@ expands correctly, and with a fresh scheduler state."
 
 (casync-deftest-thunk casync-alt/default := 42
   (casync-<!! (casync-go (casync-alt! (casync-chan) ((v) :failed) :default 42))))
+
+
+(casync-deftest-thunk casync-timeout/returns-nil :eq nil
+  (casync-<!! (casync-timeout 20)))
+
+(casync-deftest-thunk casync-timeout/interval :eq t
+  (let ((start (float-time)))
+    (casync-<!! (casync-timeout 100))
+    (>= (- (float-time) start) 0.08)))
+
+(casync-deftest-thunk casync-timeout/dedup :eq t
+  (let ((casync-timeout-resolution 0.1))
+    (let ((a (casync-timeout 1000)))
+      (eq a (casync-timeout 950)))))
+
+(casync-deftest-thunk casync-timeout/ordering :equal '(3 1 2 0)
+  (let ((order nil)
+        (t0 (casync-timeout 400))
+        (t1 (casync-timeout 300))
+        (t2 (casync-timeout 350))
+        (t3 (casync-timeout 250)))
+    (casync-go (casync-<! t0) (push 0 order))
+    (casync-go (casync-<! t1) (push 1 order))
+    (casync-go (casync-<! t2) (push 2 order))
+    (casync-go (casync-<! t3) (push 3 order))
+    (casync--pump (lambda () (= (length order) 4)))
+    (nreverse order)))
 
 
 (cort-deftest casync-go/park-outside-go-errors

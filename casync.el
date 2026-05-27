@@ -689,6 +689,62 @@ Each clause is PORT followed by (BINDINGS BODY...), or `:default EXPR'."
 Each clause is PORT followed by (BINDINGS BODY...), or `:default EXPR'."
   (casync--build-alt 'casync-alts!! clauses))
 
+
+(defvar casync-timeout-resolution 0.01
+  "Granularity in seconds for coalescing timeout channels.")
+
+(defvar casync--timeouts nil
+  "List of (DEADLINE . CHANNEL) pending timeouts, DEADLINE a `float-time'.")
+
+(defvar casync--timeout-timer nil
+  "The single Emacs timer scheduled for the soonest pending timeout.")
+
+(defun casync--timeout-reuse (deadline)
+  "Return a pending timeout channel due within resolution of DEADLINE."
+  (let ((found nil))
+    (dolist (entry casync--timeouts found)
+      (when (and (not found)
+                 (>= (car entry) deadline)
+                 (<= (- (car entry) deadline) casync-timeout-resolution))
+        (setq found (cdr entry))))))
+
+(defun casync--timeout-reschedule ()
+  "Schedule the single timeout timer for the soonest pending deadline."
+  (when casync--timeout-timer
+    (cancel-timer casync--timeout-timer)
+    (setq casync--timeout-timer nil))
+  (when casync--timeouts
+    (let ((soonest (apply #'min (mapcar #'car casync--timeouts))))
+      (setq casync--timeout-timer
+            (run-at-time (max 0 (- soonest (float-time))) nil
+                         #'casync--timeout-fire)))))
+
+(defun casync--timeout-fire ()
+  "Close all timeout channels whose deadline has arrived, in deadline order."
+  (setq casync--timeout-timer nil)
+  (let ((now (float-time))
+        (due nil))
+    (setq casync--timeouts
+          (cl-remove-if (lambda (entry)
+                          (when (<= (car entry) (+ now casync-timeout-resolution))
+                            (push entry due)
+                            t))
+                        casync--timeouts))
+    (dolist (entry (sort due (lambda (a b) (< (car a) (car b)))))
+      (setq casync--external-pending (max 0 (1- casync--external-pending)))
+      (casync-close! (cdr entry)))
+    (casync--timeout-reschedule)))
+
+(defun casync-timeout (msecs)
+  "Return a channel that closes after MSECS milliseconds."
+  (let ((deadline (+ (float-time) (/ msecs 1000.0))))
+    (or (casync--timeout-reuse deadline)
+        (let ((ch (casync-chan)))
+          (push (cons deadline ch) casync--timeouts)
+          (setq casync--external-pending (1+ casync--external-pending))
+          (casync--timeout-reschedule)
+          ch))))
+
 (provide 'casync)
 
 ;;; casync.el ends here
