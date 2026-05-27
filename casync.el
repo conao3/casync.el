@@ -271,6 +271,235 @@ when TIMEOUT elapses, or when no progress can be made."
             (accept-process-output nil 0.05)
           (error "casync: deadlock, no pending work"))))))
 
+
+(defconst casync--max-queue-size 1024
+  "Maximum number of pending puts or takes a channel may hold.")
+
+(cl-defstruct (casync--handler
+               (:constructor casync--make-handler)
+               (:copier nil))
+  flag
+  fn
+  (blockable t))
+
+(defun casync--handler-active-p (handler)
+  "Return non-nil when HANDLER has not yet committed."
+  (car (casync--handler-flag handler)))
+
+(defun casync--handler-commit (handler)
+  "Mark HANDLER committed and return its callback function."
+  (setcar (casync--handler-flag handler) nil)
+  (casync--handler-fn handler))
+
+(cl-defstruct (casync-channel
+               (:constructor casync--make-channel)
+               (:copier nil))
+  buf
+  (takes nil)
+  (puts nil)
+  (closed nil))
+
+(defun casync-chan (&optional buffer)
+  "Return a new channel.
+BUFFER is nil for an unbuffered channel, a positive integer for a
+fixed buffer of that size, or a buffer object."
+  (casync--make-channel
+   :buf (cond
+         ((null buffer) nil)
+         ((integerp buffer)
+          (if (> buffer 0)
+              (casync-buffer buffer)
+            (error "casync-chan: buffer size must be positive")))
+         ((casync--abuf-p buffer) buffer)
+         (t (error "casync-chan: invalid buffer %S" buffer)))))
+
+(defun casync--box (val)
+  "Wrap VAL as a completed-operation box."
+  (cons 'casync--box val))
+
+(defun casync--unbox (box)
+  "Return the value wrapped in BOX."
+  (cdr box))
+
+(defun casync--channel-poll-active-take (ch)
+  "Pop and return the first active pending taker of CH, or nil."
+  (let ((result nil))
+    (while (and (not result) (casync-channel-takes ch))
+      (let ((handler (pop (casync-channel-takes ch))))
+        (when (casync--handler-active-p handler)
+          (setq result handler))))
+    result))
+
+(defun casync--channel-poll-active-put (ch)
+  "Pop and return the first active pending put (VAL . HANDLER) of CH, or nil."
+  (let ((result nil))
+    (while (and (not result) (casync-channel-puts ch))
+      (let ((put (pop (casync-channel-puts ch))))
+        (when (casync--handler-active-p (cdr put))
+          (setq result put))))
+    result))
+
+(defun casync--channel-flush-buffer-to-takers (ch)
+  "Deliver buffered values of CH to any waiting takers."
+  (let ((buf (casync-channel-buf ch)))
+    (while (and buf
+                (> (casync-buffer-count buf) 0)
+                (casync-channel-takes ch))
+      (let ((taker (casync--channel-poll-active-take ch)))
+        (when taker
+          (let ((take-cb (casync--handler-commit taker))
+                (val (casync-buffer-remove! buf)))
+            (casync--dispatch (lambda () (funcall take-cb val)))))))))
+
+(defun casync--channel-fill-buffer-from-puts (ch)
+  "Move pending puts of CH into its buffer while room remains."
+  (let ((buf (casync-channel-buf ch)))
+    (while (and buf
+                (not (casync-buffer-full-p buf))
+                (casync-channel-puts ch))
+      (let ((put (casync--channel-poll-active-put ch)))
+        (when put
+          (let ((put-cb (casync--handler-commit (cdr put))))
+            (casync-buffer-add! buf (car put))
+            (casync--dispatch (lambda () (funcall put-cb t)))))))))
+
+(defun casync--channel-take! (ch handler enqueue)
+  "Attempt a take on CH for HANDLER.
+Return a box when the take completes, or nil when it parks.
+When ENQUEUE is non-nil and the take cannot complete, park HANDLER."
+  (when (casync--handler-active-p handler)
+    (let ((buf (casync-channel-buf ch)))
+      (cond
+       ((and buf (> (casync-buffer-count buf) 0))
+        (casync--handler-commit handler)
+        (let ((val (casync-buffer-remove! buf)))
+          (casync--channel-fill-buffer-from-puts ch)
+          (casync--box val)))
+       (t
+        (let ((put (casync--channel-poll-active-put ch)))
+          (cond
+           (put
+            (let ((put-cb (casync--handler-commit (cdr put))))
+              (casync--handler-commit handler)
+              (casync--dispatch (lambda () (funcall put-cb t)))
+              (casync--box (car put))))
+           ((casync-channel-closed ch)
+            (casync--handler-commit handler)
+            (casync--box nil))
+           (enqueue
+            (when (casync--handler-blockable handler)
+              (when (>= (length (casync-channel-takes ch)) casync--max-queue-size)
+                (error "casync: too many pending takes"))
+              (setf (casync-channel-takes ch)
+                    (nconc (casync-channel-takes ch) (list handler))))
+            nil)
+           (t nil))))))))
+
+(defun casync--channel-put! (ch val handler enqueue)
+  "Attempt to put VAL on CH for HANDLER.
+Return a box when the put completes, or nil when it parks.
+When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
+  (when (null val)
+    (error "casync: cannot put nil on a channel"))
+  (when (casync--handler-active-p handler)
+    (cond
+     ((casync-channel-closed ch)
+      (casync--handler-commit handler)
+      (casync--box nil))
+     (t
+      (let ((buf (casync-channel-buf ch)))
+        (cond
+         ((and buf (not (casync-buffer-full-p buf)))
+          (casync--handler-commit handler)
+          (casync-buffer-add! buf val)
+          (casync--channel-flush-buffer-to-takers ch)
+          (casync--box t))
+         (t
+          (let ((taker (casync--channel-poll-active-take ch)))
+            (cond
+             (taker
+              (let ((take-cb (casync--handler-commit taker)))
+                (casync--handler-commit handler)
+                (casync--dispatch (lambda () (funcall take-cb val)))
+                (casync--box t)))
+             (enqueue
+              (when (casync--handler-blockable handler)
+                (when (>= (length (casync-channel-puts ch)) casync--max-queue-size)
+                  (error "casync: too many pending puts"))
+                (setf (casync-channel-puts ch)
+                      (nconc (casync-channel-puts ch) (list (cons val handler)))))
+              nil)
+             (t nil))))))))))
+
+(defun casync-take! (ch fn &optional on-caller)
+  "Take a value from CH and call FN with it.
+When ON-CALLER is non-nil and a value is immediately available, call
+FN synchronously; otherwise FN runs on the scheduler."
+  (let* ((handler (casync--make-handler :flag (list t) :fn fn))
+         (box (casync--channel-take! ch handler t)))
+    (when box
+      (let ((val (casync--unbox box)))
+        (if on-caller
+            (funcall fn val)
+          (casync--dispatch (lambda () (funcall fn val))))))
+    nil))
+
+(defun casync-put! (ch val fn &optional on-caller)
+  "Put VAL on CH and call FN with t on success or nil when CH is closed.
+When ON-CALLER is non-nil and the put completes immediately, call FN
+synchronously; otherwise FN runs on the scheduler."
+  (let* ((handler (casync--make-handler :flag (list t) :fn fn))
+         (box (casync--channel-put! ch val handler t)))
+    (when box
+      (let ((ret (casync--unbox box)))
+        (if on-caller
+            (funcall fn ret)
+          (casync--dispatch (lambda () (funcall fn ret))))))
+    nil))
+
+(defun casync-offer! (ch val)
+  "Put VAL on CH without blocking.
+Return t when the value was accepted, nil otherwise."
+  (let* ((handler (casync--make-handler :flag (list t) :fn #'ignore :blockable nil))
+         (box (casync--channel-put! ch val handler nil)))
+    (and box (casync--unbox box))))
+
+(defun casync-poll! (ch)
+  "Take a value from CH without blocking.
+Return the value, or nil when none is immediately available."
+  (let* ((handler (casync--make-handler :flag (list t) :fn #'ignore :blockable nil))
+         (box (casync--channel-take! ch handler nil)))
+    (and box (casync--unbox box))))
+
+(defun casync-close! (ch)
+  "Close CH.  Pending takers receive buffered values then nil.  Return nil."
+  (unless (casync-channel-closed ch)
+    (setf (casync-channel-closed ch) t)
+    (let ((buf (casync-channel-buf ch))
+          (taker nil))
+      (while (setq taker (casync--channel-poll-active-take ch))
+        (let ((take-cb (casync--handler-commit taker))
+              (val (when (and buf (> (casync-buffer-count buf) 0))
+                     (casync-buffer-remove! buf))))
+          (casync--dispatch (lambda () (funcall take-cb val)))))
+      (when buf (casync-buffer-close! buf))))
+  nil)
+
+(defun casync-<!! (ch)
+  "Take a value from CH, pumping the scheduler until one arrives."
+  (let ((got nil) (result nil))
+    (casync-take! ch (lambda (v) (setq result v got t)))
+    (casync--pump (lambda () got))
+    result))
+
+(defun casync->!! (ch val)
+  "Put VAL on CH, pumping the scheduler until the put completes.
+Return t on success or nil when CH is closed."
+  (let ((got nil) (result nil))
+    (casync-put! ch val (lambda (r) (setq result r got t)))
+    (casync--pump (lambda () got))
+    result))
+
 (provide 'casync)
 
 ;;; casync.el ends here
