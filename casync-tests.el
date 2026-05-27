@@ -487,6 +487,63 @@ expands correctly, and with a fresh scheduler state."
           (casync-<!! (casync-into nil b-strs)))))
 
 
+(casync-deftest-thunk casync-thread/computes := 42
+  (casync-<!! (casync-thread (+ 2 40))))
+
+(casync-deftest-thunk casync-thread/in-go := 30
+  (casync-<!! (casync-go (+ 10 (casync-<! (casync-thread (* 4 5)))))))
+
+(casync-deftest-thunk casync-pipeline-async/inc :equal '(1 2 3 4 5)
+  (let ((to (casync-chan)) (from (casync-to-chan! (number-sequence 0 4))))
+    (casync-pipeline-async
+     2 to
+     (lambda (v ch) (casync-go (casync->! ch (1+ v)) (casync-close! ch)))
+     from)
+    (casync-<!! (casync-into nil to))))
+
+(casync-deftest-thunk casync-pipeline-async/multiplier :equal '(0 0 1 0 1 2 0 1 2 3)
+  (let ((to (casync-chan)) (from (casync-to-chan! (number-sequence 1 4))))
+    (casync-pipeline-async
+     2 to
+     (lambda (v ch) (casync-go (dotimes (i v) (casync->! ch i)) (casync-close! ch)))
+     from)
+    (casync-<!! (casync-into nil to))))
+
+(casync-deftest-thunk casync-pipeline/map :equal '(1 2 3 4 5)
+  (let ((to (casync-chan)) (from (casync-to-chan! (number-sequence 0 4))))
+    (casync-pipeline 2 to #'1+ from)
+    (casync-<!! (casync-into nil to))))
+
+(casync-deftest-thunk casync-pipeline/sizes :eq t
+  (let ((ok t))
+    (dolist (spec '((1 . 0) (1 . 10) (10 . 10) (20 . 10)))
+      (let* ((n (car spec)) (size (cdr spec))
+             (input (number-sequence 0 (1- size)))
+             (to (casync-chan))
+             (out (casync-<!! (casync-into nil
+                                           (progn (casync-pipeline n to #'identity
+                                                                   (casync-to-chan! input))
+                                                  to)))))
+        (unless (equal out input) (setq ok nil))))
+    ok))
+
+(casync-deftest-thunk casync-exceptions/put-callback :eq 'error
+  (let ((captured nil) (c (casync-chan)))
+    (let ((casync-error-handler (lambda (e) (setq captured (car e)))))
+      (casync-put! c :foo (lambda (_) (error "boom")))
+      (casync-take! c #'ignore)
+      (casync--pump (lambda () captured)))
+    captured))
+
+(casync-deftest-thunk casync-exceptions/take-callback :eq 'error
+  (let ((captured nil) (c (casync-chan)))
+    (let ((casync-error-handler (lambda (e) (setq captured (car e)))))
+      (casync-take! c (lambda (_) (error "boom")))
+      (casync-put! c :foo #'ignore)
+      (casync--pump (lambda () captured)))
+    captured))
+
+
 (cort-deftest casync-go/park-outside-go-errors
   '((:cort-error error
      (casync-<! (casync-chan)))))

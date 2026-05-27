@@ -32,6 +32,7 @@
   (require 'cl-lib)
   (require 'generator)
   (require 'iter2))
+(require 'async)
 
 (defgroup casync nil
   "Elisp port of clojure.core.async."
@@ -959,6 +960,61 @@ BUFFER is passed to `casync-chan'."
         (puthash topic entry (casync--get p :mults))))
     (casync-tap (cdr entry) ch close)
     ch))
+
+(defun casync--thread-call (fn)
+  "Run FN in a child Emacs process and return a channel with its result."
+  (let ((ch (casync-chan 1)))
+    (setq casync--external-pending (1+ casync--external-pending))
+    (async-start
+     fn
+     (lambda (result)
+       (setq casync--external-pending (max 0 (1- casync--external-pending)))
+       (when result (casync-put! ch result #'ignore))
+       (casync-close! ch)))
+    ch))
+
+(defmacro casync-thread (&rest body)
+  "Run BODY in a child Emacs process, delivering its result on a channel.
+BODY must be self-contained and return a single serializable value; it
+cannot share channels, closures, or dynamic bindings with the parent."
+  (declare (indent 0))
+  `(casync--thread-call (lambda () ,@body)))
+
+(cl-defun casync-pipeline-async (n to af from &optional (close t))
+  "Take values from FROM, apply async AF with parallelism N, put on TO in order.
+AF is called as (AF INPUT RESULT-CH) and must put results on RESULT-CH and
+close it.  Close TO when FROM is exhausted unless CLOSE is nil.  Return TO."
+  (let ((results (casync-chan n)))
+    (casync-go-loop ()
+      (let ((input (casync-<! from)))
+        (if (null input)
+            (casync-close! results)
+          (let ((rc (casync-chan 1)))
+            (funcall af input rc)
+            (casync->! results rc)
+            (casync-recur)))))
+    (casync-go-loop ()
+      (let ((rc (casync-<! results)))
+        (if (null rc)
+            (when close (casync-close! to))
+          (let ((v nil))
+            (while (setq v (casync-<! rc))
+              (casync->! to v)))
+          (casync-recur))))
+    to))
+
+(cl-defun casync-pipeline (n to f from &optional (close t))
+  "Apply function F to each value from FROM with parallelism N, put on TO.
+F maps one input to one output.  Return TO."
+  (casync-pipeline-async
+   n to
+   (lambda (input rc)
+     (casync-go (casync->! rc (funcall f input)) (casync-close! rc)))
+   from close))
+
+(defalias 'casync-pipeline-blocking 'casync-pipeline
+  "Like `casync-pipeline'.
+Offload genuinely blocking or CPU-bound work with `casync-thread' inside F.")
 
 (provide 'casync)
 
