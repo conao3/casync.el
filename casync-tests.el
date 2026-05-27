@@ -311,6 +311,17 @@ expands correctly, and with a fresh scheduler state."
     (casync-<!! c)))
 
 
+(casync-deftest-thunk casync-go-loop/accumulate :equal '(1 2 3)
+  (let ((c (casync-chan 5)))
+    (dolist (x '(1 2 3)) (casync->!! c x))
+    (casync-close! c)
+    (casync-<!! (casync-go-loop ((acc nil))
+                  (let ((v (casync-<! c)))
+                    (if v
+                        (casync-recur (cons v acc))
+                      (nreverse acc)))))))
+
+
 (defun casync-test--ident (v)
   "Return a fresh channel already holding value V."
   (let ((c (casync-chan 1)))
@@ -390,6 +401,90 @@ expands correctly, and with a fresh scheduler state."
     (casync-go (casync-<! t3) (push 3 order))
     (casync--pump (lambda () (= (length order) 4)))
     (nreverse order)))
+
+
+(casync-deftest-thunk casync-ops/to-chan-into :equal '(0 1 2 3 4 5 6 7 8 9)
+  (casync-<!! (casync-into nil (casync-to-chan! (number-sequence 0 9)))))
+
+(casync-deftest-thunk casync-ops/onto-chan :equal '(0 1 2 3 4)
+  (let ((ch (casync-chan 10)))
+    (casync-onto-chan! ch (number-sequence 0 4))
+    (casync-<!! (casync-into nil ch))))
+
+(casync-deftest-thunk casync-ops/pipe :equal '(1 2 3 4 5)
+  (let ((out (casync-chan)))
+    (casync-pipe (casync-to-chan! '(1 2 3 4 5)) out)
+    (casync-<!! (casync-into nil out))))
+
+(casync-deftest-thunk casync-ops/reduce-sum := 45
+  (casync-<!! (casync-reduce #'+ 0 (casync-to-chan! (number-sequence 0 9)))))
+
+(casync-deftest-thunk casync-ops/reduce-empty := 0
+  (casync-<!! (casync-reduce #'+ 0 (casync-to-chan! nil))))
+
+(casync-deftest-thunk casync-ops/reduce-reduced :eq :foo
+  (casync-<!! (casync-reduce (lambda (acc x) (if (= x 2) (casync-reduced :foo) acc))
+                             0 (casync-to-chan! (number-sequence 0 9)))))
+
+(casync-deftest-thunk casync-ops/take :equal '(0 1 2)
+  (casync-<!! (casync-into nil (casync-take 3 (casync-to-chan! (number-sequence 0 9))))))
+
+(casync-deftest-thunk casync-ops/merge :equal '(0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3)
+  (sort (casync-<!! (casync-into nil
+                                 (casync-merge
+                                  (list (casync-to-chan! '(0 1 2 3))
+                                        (casync-to-chan! '(0 1 2 3))
+                                        (casync-to-chan! '(0 1 2 3))
+                                        (casync-to-chan! '(0 1 2 3))))))
+        #'<))
+
+(casync-deftest-thunk casync-ops/split :equal '((2 4 6) (1 3 5))
+  (let ((parts (casync-split (lambda (x) (= 0 (% x 2)))
+                             (casync-to-chan! '(1 2 3 4 5 6)) 8 8)))
+    (list (casync-<!! (casync-into nil (nth 0 parts)))
+          (casync-<!! (casync-into nil (nth 1 parts))))))
+
+(casync-deftest-thunk casync-ops/unique :equal '(1 2 3 4)
+  (casync-<!! (casync-into nil (casync-unique (casync-to-chan! '(1 1 2 2 3 3 3 3 4))))))
+
+(casync-deftest-thunk casync-ops/partition :equal '((1 2) (2 3))
+  (casync-<!! (casync-into nil (casync-partition 2 (casync-to-chan! '(1 2 2 3))))))
+
+(casync-deftest-thunk casync-ops/partition-by :equal '(("a" "b") (1 :2 3) ("c"))
+  (casync-<!! (casync-into nil
+                           (casync-partition-by
+                            #'stringp (casync-to-chan! '("a" "b" 1 :2 3 "c"))))))
+
+(casync-deftest-thunk casync-ops/mult :equal '((0 1 2 3) (0 1 2 3))
+  (let ((a (casync-chan 4)) (b (casync-chan 4)) (src (casync-chan)))
+    (let ((m (casync-mult src)))
+      (casync-tap m a)
+      (casync-tap m b)
+      (casync-pipe (casync-to-chan! '(0 1 2 3)) src)
+      (list (casync-<!! (casync-into nil a))
+            (casync-<!! (casync-into nil b))))))
+
+(casync-deftest-thunk casync-ops/mix :equal '(1 2 3 4 5 6)
+  (let* ((out (casync-chan)) (mx (casync-mix out)))
+    (casync-admix mx (casync-to-chan! '(1 2 3)))
+    (casync-admix mx (casync-to-chan! '(4 5 6)))
+    (sort (casync-<!! (casync-into nil (casync-take 6 out))) #'<)))
+
+(casync-deftest-thunk casync-ops/pub-sub
+    :equal '((1 2 3) (1 2 3) ("a" "b" "c") ("a" "b" "c"))
+  (let* ((a-ints (casync-chan 5)) (b-ints (casync-chan 5))
+         (a-strs (casync-chan 5)) (b-strs (casync-chan 5))
+         (src (casync-chan))
+         (p (casync-pub src (lambda (x) (if (stringp x) :string :int)))))
+    (casync-sub p :string a-strs)
+    (casync-sub p :string b-strs)
+    (casync-sub p :int a-ints)
+    (casync-sub p :int b-ints)
+    (casync-pipe (casync-to-chan! '(1 "a" 2 "b" 3 "c")) src)
+    (list (casync-<!! (casync-into nil a-ints))
+          (casync-<!! (casync-into nil b-ints))
+          (casync-<!! (casync-into nil a-strs))
+          (casync-<!! (casync-into nil b-strs)))))
 
 
 (cort-deftest casync-go/park-outside-go-errors

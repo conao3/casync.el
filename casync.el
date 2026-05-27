@@ -25,12 +25,13 @@
 
 ;; Elisp port of clojure.core.async.
 
-
+
 ;;; Code:
 
-(require 'cl-lib)
-(require 'generator)
-(require 'iter2)
+(eval-and-compile
+  (require 'cl-lib)
+  (require 'generator)
+  (require 'iter2))
 
 (defgroup casync nil
   "Elisp port of clojure.core.async."
@@ -38,148 +39,86 @@
   :link '(url-link :tag "Github" "https://github.com/conao3/casync.el"))
 
 
-(cl-defstruct (casync--abuf (:constructor nil) (:copier nil)))
+(defsubst casync--get (object key)
+  "Return the value stored under KEY in tagged-plist OBJECT."
+  (plist-get (cdr object) key))
 
-(cl-defstruct (casync--fixed-buffer
-               (:include casync--abuf)
-               (:constructor casync--make-fixed-buffer (n))
-               (:copier nil))
-  (items nil)
-  n)
+(defun casync--set (object key value)
+  "Store VALUE under KEY in tagged-plist OBJECT and return OBJECT."
+  (setcdr object (plist-put (cdr object) key value))
+  object)
 
-(cl-defstruct (casync--dropping-buffer
-               (:include casync--abuf)
-               (:constructor casync--make-dropping-buffer (n))
-               (:copier nil))
-  (items nil)
-  n)
-
-(cl-defstruct (casync--sliding-buffer
-               (:include casync--abuf)
-               (:constructor casync--make-sliding-buffer (n))
-               (:copier nil))
-  (items nil)
-  n)
-
-(cl-defstruct (casync--promise-buffer
-               (:include casync--abuf)
-               (:constructor casync--make-promise-buffer ())
-               (:copier nil))
-  (value nil)
-  (set nil))
 
 (defun casync-buffer (n)
   "Return a fixed buffer that holds up to N items."
-  (casync--make-fixed-buffer n))
+  (list 'casync--fixed :items nil :n n))
 
 (defun casync-dropping-buffer (n)
   "Return a dropping buffer of size N that drops new items when full."
-  (casync--make-dropping-buffer n))
+  (list 'casync--dropping :items nil :n n))
 
 (defun casync-sliding-buffer (n)
   "Return a sliding buffer of size N that drops old items when full."
-  (casync--make-sliding-buffer n))
+  (list 'casync--sliding :items nil :n n))
 
 (defun casync-promise-buffer ()
   "Return a promise buffer holding a single value permanently."
-  (casync--make-promise-buffer))
+  (list 'casync--promise :value nil :set nil))
 
-(cl-defgeneric casync-unblocking-buffer-p (buffer)
-  "Return non-nil when adding to BUFFER never blocks.")
+(defun casync--buffer-p (object)
+  "Return non-nil when OBJECT is a casync buffer."
+  (memq (car-safe object)
+        '(casync--fixed casync--dropping casync--sliding casync--promise)))
 
-(cl-defmethod casync-unblocking-buffer-p ((_buffer casync--fixed-buffer)) nil)
-(cl-defmethod casync-unblocking-buffer-p ((_buffer casync--dropping-buffer)) t)
-(cl-defmethod casync-unblocking-buffer-p ((_buffer casync--sliding-buffer)) t)
-(cl-defmethod casync-unblocking-buffer-p ((_buffer casync--promise-buffer)) t)
+(defun casync-unblocking-buffer-p (buffer)
+  "Return non-nil when adding to BUFFER never blocks."
+  (and (memq (car buffer) '(casync--dropping casync--sliding casync--promise)) t))
 
-(cl-defgeneric casync-buffer-count (buffer)
-  "Return the number of items currently in BUFFER.")
+(defun casync-buffer-count (buffer)
+  "Return the number of items currently in BUFFER."
+  (if (eq (car buffer) 'casync--promise)
+      (if (casync--get buffer :set) 1 0)
+    (length (casync--get buffer :items))))
 
-(cl-defmethod casync-buffer-count ((buffer casync--fixed-buffer))
-  (length (casync--fixed-buffer-items buffer)))
+(defun casync-buffer-full-p (buffer)
+  "Return non-nil when BUFFER cannot accept more items without blocking."
+  (and (eq (car buffer) 'casync--fixed)
+       (>= (length (casync--get buffer :items))
+           (casync--get buffer :n))))
 
-(cl-defmethod casync-buffer-count ((buffer casync--dropping-buffer))
-  (length (casync--dropping-buffer-items buffer)))
-
-(cl-defmethod casync-buffer-count ((buffer casync--sliding-buffer))
-  (length (casync--sliding-buffer-items buffer)))
-
-(cl-defmethod casync-buffer-count ((buffer casync--promise-buffer))
-  (if (casync--promise-buffer-set buffer) 1 0))
-
-(cl-defgeneric casync-buffer-full-p (buffer)
-  "Return non-nil when BUFFER cannot accept more items without blocking.")
-
-(cl-defmethod casync-buffer-full-p ((buffer casync--fixed-buffer))
-  (>= (length (casync--fixed-buffer-items buffer))
-      (casync--fixed-buffer-n buffer)))
-
-(cl-defmethod casync-buffer-full-p ((_buffer casync--dropping-buffer)) nil)
-(cl-defmethod casync-buffer-full-p ((_buffer casync--sliding-buffer)) nil)
-(cl-defmethod casync-buffer-full-p ((_buffer casync--promise-buffer)) nil)
-
-(cl-defgeneric casync-buffer-add! (buffer item)
-  "Add ITEM to BUFFER and return BUFFER.")
-
-(cl-defmethod casync-buffer-add! ((buffer casync--fixed-buffer) item)
-  (cl-assert (not (casync-buffer-full-p buffer)) t "casync-buffer-add!: buffer full")
-  (setf (casync--fixed-buffer-items buffer)
-        (append (casync--fixed-buffer-items buffer) (list item)))
+(defun casync-buffer-add! (buffer item)
+  "Add ITEM to BUFFER and return BUFFER."
+  (pcase (car buffer)
+    ('casync--fixed
+     (when (casync-buffer-full-p buffer)
+       (error "casync-buffer-add!: buffer full"))
+     (casync--set buffer :items (append (casync--get buffer :items) (list item))))
+    ('casync--dropping
+     (when (< (length (casync--get buffer :items)) (casync--get buffer :n))
+       (casync--set buffer :items (append (casync--get buffer :items) (list item)))))
+    ('casync--sliding
+     (casync--set buffer :items (append (casync--get buffer :items) (list item)))
+     (when (> (length (casync--get buffer :items)) (casync--get buffer :n))
+       (casync--set buffer :items (cdr (casync--get buffer :items)))))
+    ('casync--promise
+     (unless (casync--get buffer :set)
+       (casync--set buffer :value item)
+       (casync--set buffer :set t))))
   buffer)
 
-(cl-defmethod casync-buffer-add! ((buffer casync--dropping-buffer) item)
-  (when (< (length (casync--dropping-buffer-items buffer))
-           (casync--dropping-buffer-n buffer))
-    (setf (casync--dropping-buffer-items buffer)
-          (append (casync--dropping-buffer-items buffer) (list item))))
-  buffer)
+(defun casync-buffer-remove! (buffer)
+  "Remove and return the next item from BUFFER."
+  (if (eq (car buffer) 'casync--promise)
+      (casync--get buffer :value)
+    (let ((items (casync--get buffer :items)))
+      (when (null items)
+        (error "casync-buffer-remove!: buffer empty"))
+      (casync--set buffer :items (cdr items))
+      (car items))))
 
-(cl-defmethod casync-buffer-add! ((buffer casync--sliding-buffer) item)
-  (setf (casync--sliding-buffer-items buffer)
-        (append (casync--sliding-buffer-items buffer) (list item)))
-  (when (> (length (casync--sliding-buffer-items buffer))
-           (casync--sliding-buffer-n buffer))
-    (setf (casync--sliding-buffer-items buffer)
-          (cdr (casync--sliding-buffer-items buffer))))
-  buffer)
-
-(cl-defmethod casync-buffer-add! ((buffer casync--promise-buffer) item)
-  (unless (casync--promise-buffer-set buffer)
-    (setf (casync--promise-buffer-value buffer) item
-          (casync--promise-buffer-set buffer) t))
-  buffer)
-
-(cl-defgeneric casync-buffer-remove! (buffer)
-  "Remove and return the next item from BUFFER.")
-
-(cl-defmethod casync-buffer-remove! ((buffer casync--fixed-buffer))
-  (when (null (casync--fixed-buffer-items buffer))
-    (error "casync-buffer-remove!: buffer empty"))
-  (prog1 (car (casync--fixed-buffer-items buffer))
-    (setf (casync--fixed-buffer-items buffer)
-          (cdr (casync--fixed-buffer-items buffer)))))
-
-(cl-defmethod casync-buffer-remove! ((buffer casync--dropping-buffer))
-  (when (null (casync--dropping-buffer-items buffer))
-    (error "casync-buffer-remove!: buffer empty"))
-  (prog1 (car (casync--dropping-buffer-items buffer))
-    (setf (casync--dropping-buffer-items buffer)
-          (cdr (casync--dropping-buffer-items buffer)))))
-
-(cl-defmethod casync-buffer-remove! ((buffer casync--sliding-buffer))
-  (when (null (casync--sliding-buffer-items buffer))
-    (error "casync-buffer-remove!: buffer empty"))
-  (prog1 (car (casync--sliding-buffer-items buffer))
-    (setf (casync--sliding-buffer-items buffer)
-          (cdr (casync--sliding-buffer-items buffer)))))
-
-(cl-defmethod casync-buffer-remove! ((buffer casync--promise-buffer))
-  (casync--promise-buffer-value buffer))
-
-(cl-defgeneric casync-buffer-close! (buffer)
-  "Notify BUFFER that its channel is closing.  Return nil.")
-
-(cl-defmethod casync-buffer-close! ((_buffer casync--abuf)) nil)
+(defun casync-buffer-close! (_buffer)
+  "Notify a buffer that its channel is closing.  Return nil."
+  nil)
 
 
 (defvar casync-error-handler #'casync--default-error-handler
@@ -277,47 +216,51 @@ when TIMEOUT elapses, or when no progress can be made."
 (defconst casync--max-queue-size 1024
   "Maximum number of pending puts or takes a channel may hold.")
 
-(cl-defstruct (casync--handler
-               (:constructor casync--make-handler)
-               (:copier nil))
-  flag
-  fn
-  (blockable t))
+(defun casync--make-handler (flag fn blockable)
+  "Return a handler sharing commit cell FLAG, callback FN, blockable BLOCKABLE."
+  (list 'casync--handler :flag flag :fn fn :blockable blockable))
 
 (defun casync--handler-active-p (handler)
   "Return non-nil when HANDLER has not yet committed."
-  (car (casync--handler-flag handler)))
+  (car (casync--get handler :flag)))
 
 (defun casync--handler-commit (handler)
   "Mark HANDLER committed and return its callback function."
-  (setcar (casync--handler-flag handler) nil)
-  (casync--handler-fn handler))
+  (setcar (casync--get handler :flag) nil)
+  (casync--get handler :fn))
 
-(cl-defstruct (casync-channel
-               (:constructor casync--make-channel)
-               (:copier nil))
-  buf
-  (takes nil)
-  (puts nil)
-  (closed nil))
+(defun casync--handler-blockable (handler)
+  "Return non-nil when HANDLER may park."
+  (casync--get handler :blockable))
 
 (defun casync-chan (&optional buffer)
   "Return a new channel.
 BUFFER is nil for an unbuffered channel, a positive integer for a
 fixed buffer of that size, or a buffer object."
-  (casync--make-channel
-   :buf (cond
-         ((null buffer) nil)
-         ((integerp buffer)
-          (if (> buffer 0)
-              (casync-buffer buffer)
-            (error "casync-chan: buffer size must be positive")))
-         ((casync--abuf-p buffer) buffer)
-         (t (error "casync-chan: invalid buffer %S" buffer)))))
+  (list 'casync--channel
+        :buf (cond
+              ((null buffer) nil)
+              ((integerp buffer)
+               (if (> buffer 0)
+                   (casync-buffer buffer)
+                 (error "casync-chan: buffer size must be positive")))
+              ((casync--buffer-p buffer) buffer)
+              (t (error "casync-chan: invalid buffer %S" buffer)))
+        :takes nil
+        :puts nil
+        :closed nil))
+
+(defun casync-channel-p (object)
+  "Return non-nil when OBJECT is a channel."
+  (eq (car-safe object) 'casync--channel))
 
 (defun casync-promise-chan ()
   "Return a promise channel delivering at most one value to all takers."
-  (casync--make-channel :buf (casync-promise-buffer)))
+  (list 'casync--channel
+        :buf (casync-promise-buffer)
+        :takes nil
+        :puts nil
+        :closed nil))
 
 (defun casync--box (val)
   "Wrap VAL as a completed-operation box."
@@ -329,28 +272,34 @@ fixed buffer of that size, or a buffer object."
 
 (defun casync--channel-poll-active-take (ch)
   "Pop and return the first active pending taker of CH, or nil."
-  (let ((result nil))
-    (while (and (not result) (casync-channel-takes ch))
-      (let ((handler (pop (casync-channel-takes ch))))
+  (let ((result nil)
+        (takes (casync--get ch :takes)))
+    (while (and (not result) takes)
+      (let ((handler (car takes)))
+        (setq takes (cdr takes))
         (when (casync--handler-active-p handler)
           (setq result handler))))
+    (casync--set ch :takes takes)
     result))
 
 (defun casync--channel-poll-active-put (ch)
   "Pop and return the first active pending put (VAL . HANDLER) of CH, or nil."
-  (let ((result nil))
-    (while (and (not result) (casync-channel-puts ch))
-      (let ((put (pop (casync-channel-puts ch))))
+  (let ((result nil)
+        (puts (casync--get ch :puts)))
+    (while (and (not result) puts)
+      (let ((put (car puts)))
+        (setq puts (cdr puts))
         (when (casync--handler-active-p (cdr put))
           (setq result put))))
+    (casync--set ch :puts puts)
     result))
 
 (defun casync--channel-flush-buffer-to-takers (ch)
   "Deliver buffered values of CH to any waiting takers."
-  (let ((buf (casync-channel-buf ch)))
+  (let ((buf (casync--get ch :buf)))
     (while (and buf
                 (> (casync-buffer-count buf) 0)
-                (casync-channel-takes ch))
+                (casync--get ch :takes))
       (let ((taker (casync--channel-poll-active-take ch)))
         (when taker
           (let ((take-cb (casync--handler-commit taker))
@@ -359,10 +308,10 @@ fixed buffer of that size, or a buffer object."
 
 (defun casync--channel-fill-buffer-from-puts (ch)
   "Move pending puts of CH into its buffer while room remains."
-  (let ((buf (casync-channel-buf ch)))
+  (let ((buf (casync--get ch :buf)))
     (while (and buf
                 (not (casync-buffer-full-p buf))
-                (casync-channel-puts ch))
+                (casync--get ch :puts))
       (let ((put (casync--channel-poll-active-put ch)))
         (when put
           (let ((put-cb (casync--handler-commit (cdr put))))
@@ -374,7 +323,7 @@ fixed buffer of that size, or a buffer object."
 Return a box when the take completes, or nil when it parks.
 When ENQUEUE is non-nil and the take cannot complete, park HANDLER."
   (when (casync--handler-active-p handler)
-    (let ((buf (casync-channel-buf ch)))
+    (let ((buf (casync--get ch :buf)))
       (cond
        ((and buf (> (casync-buffer-count buf) 0))
         (casync--handler-commit handler)
@@ -389,18 +338,18 @@ When ENQUEUE is non-nil and the take cannot complete, park HANDLER."
               (casync--handler-commit handler)
               (casync--dispatch (lambda () (funcall put-cb t)))
               (casync--box (car put))))
-           ((casync-channel-closed ch)
+           ((casync--get ch :closed)
             (casync--handler-commit handler)
             (casync--box nil))
            (enqueue
             (when (casync--handler-blockable handler)
-              (setf (casync-channel-takes ch)
-                    (cl-delete-if-not #'casync--handler-active-p
-                                      (casync-channel-takes ch)))
-              (when (>= (length (casync-channel-takes ch)) casync--max-queue-size)
+              (casync--set ch :takes
+                           (cl-delete-if-not #'casync--handler-active-p
+                                             (casync--get ch :takes)))
+              (when (>= (length (casync--get ch :takes)) casync--max-queue-size)
                 (error "casync: too many pending takes"))
-              (setf (casync-channel-takes ch)
-                    (nconc (casync-channel-takes ch) (list handler))))
+              (casync--set ch :takes
+                           (nconc (casync--get ch :takes) (list handler))))
             nil)
            (t nil))))))))
 
@@ -412,11 +361,11 @@ When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
     (error "casync: cannot put nil on a channel"))
   (when (casync--handler-active-p handler)
     (cond
-     ((casync-channel-closed ch)
+     ((casync--get ch :closed)
       (casync--handler-commit handler)
       (casync--box nil))
      (t
-      (let ((buf (casync-channel-buf ch)))
+      (let ((buf (casync--get ch :buf)))
         (cond
          ((and buf (not (casync-buffer-full-p buf)))
           (casync--handler-commit handler)
@@ -433,13 +382,14 @@ When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
                 (casync--box t)))
              (enqueue
               (when (casync--handler-blockable handler)
-                (setf (casync-channel-puts ch)
-                      (cl-delete-if-not (lambda (p) (casync--handler-active-p (cdr p)))
-                                        (casync-channel-puts ch)))
-                (when (>= (length (casync-channel-puts ch)) casync--max-queue-size)
+                (casync--set ch :puts
+                             (cl-delete-if-not
+                              (lambda (p) (casync--handler-active-p (cdr p)))
+                              (casync--get ch :puts)))
+                (when (>= (length (casync--get ch :puts)) casync--max-queue-size)
                   (error "casync: too many pending puts"))
-                (setf (casync-channel-puts ch)
-                      (nconc (casync-channel-puts ch) (list (cons val handler)))))
+                (casync--set ch :puts
+                             (nconc (casync--get ch :puts) (list (cons val handler)))))
               nil)
              (t nil))))))))))
 
@@ -447,7 +397,7 @@ When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
   "Take a value from CH and call FN with it.
 When ON-CALLER is non-nil and a value is immediately available, call
 FN synchronously; otherwise FN runs on the scheduler."
-  (let* ((handler (casync--make-handler :flag (list t) :fn fn))
+  (let* ((handler (casync--make-handler (list t) fn t))
          (box (casync--channel-take! ch handler t)))
     (when box
       (let ((val (casync--unbox box)))
@@ -460,7 +410,7 @@ FN synchronously; otherwise FN runs on the scheduler."
   "Put VAL on CH and call FN with t on success or nil when CH is closed.
 When ON-CALLER is non-nil and the put completes immediately, call FN
 synchronously; otherwise FN runs on the scheduler."
-  (let* ((handler (casync--make-handler :flag (list t) :fn fn))
+  (let* ((handler (casync--make-handler (list t) fn t))
          (box (casync--channel-put! ch val handler t)))
     (when box
       (let ((ret (casync--unbox box)))
@@ -472,22 +422,22 @@ synchronously; otherwise FN runs on the scheduler."
 (defun casync-offer! (ch val)
   "Put VAL on CH without blocking.
 Return t when the value was accepted, nil otherwise."
-  (let* ((handler (casync--make-handler :flag (list t) :fn #'ignore :blockable nil))
+  (let* ((handler (casync--make-handler (list t) #'ignore nil))
          (box (casync--channel-put! ch val handler nil)))
     (and box (casync--unbox box))))
 
 (defun casync-poll! (ch)
   "Take a value from CH without blocking.
 Return the value, or nil when none is immediately available."
-  (let* ((handler (casync--make-handler :flag (list t) :fn #'ignore :blockable nil))
+  (let* ((handler (casync--make-handler (list t) #'ignore nil))
          (box (casync--channel-take! ch handler nil)))
     (and box (casync--unbox box))))
 
 (defun casync-close! (ch)
   "Close CH.  Pending takers receive buffered values then nil.  Return nil."
-  (unless (casync-channel-closed ch)
-    (setf (casync-channel-closed ch) t)
-    (let ((buf (casync-channel-buf ch))
+  (unless (casync--get ch :closed)
+    (casync--set ch :closed t)
+    (let ((buf (casync--get ch :buf))
           (taker nil))
       (while (setq taker (casync--channel-poll-active-take ch))
         (let ((take-cb (casync--handler-commit taker))
@@ -513,6 +463,8 @@ Return t on success or nil when CH is closed."
     result))
 
 
+(eval-and-compile
+
 (defmacro casync-<! (ch)
   "Park the current go block until a value is taken from CH.
 Valid only inside the body of `casync-go'."
@@ -531,11 +483,42 @@ or (CHANNEL VALUE) lists (put operations).  OPTS may include
 Valid only inside the body of `casync-go'."
   `(iter-yield (list :alts ,ops (list ,@opts))))
 
+(defmacro casync-recur (&rest vals)
+  "Recur to the enclosing `casync-go-loop' with VALS as the new bindings."
+  `(throw 'casync--go-loop-recur (list ,@vals)))
+
+(defmacro casync-go-loop (bindings &rest body)
+  "Like `casync-go' wrapping a loop over BINDINGS.
+Inside BODY, call `casync-recur' in tail position to loop with new
+binding values; any other value finishes the loop and is delivered."
+  (declare (indent 1))
+  (let ((vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
+        (next (gensym "casync--loop-next-"))
+        (ret (gensym "casync--loop-ret-"))
+        (again (gensym "casync--loop-again-"))
+        (idx -1))
+    `(casync-go
+      (let* (,@bindings (,ret nil) (,again t))
+        (while ,again
+          (setq ,again nil)
+          (let ((,next (catch 'casync--go-loop-recur
+                         (setq ,ret (progn ,@body))
+                         'casync--go-loop-done)))
+            (unless (eq ,next 'casync--go-loop-done)
+              ,@(mapcar (lambda (v)
+                          (setq idx (1+ idx))
+                          `(setq ,v (nth ,idx ,next)))
+                        vars)
+              (setq ,again t))))
+        ,ret))))
+
 (defmacro casync-go (&rest body)
   "Run BODY asynchronously as a go block.
 Return a channel that yields BODY's value and then closes."
   (declare (indent 0))
   `(casync--run-go (iter2-lambda () ,@body)))
+
+)
 
 (defun casync--run-go (machine)
   "Start go MACHINE and return its result channel."
@@ -605,9 +588,9 @@ OPTS may include `:default VALUE' and `:priority t'."
           (if (casync-channel-p op)
               (let* ((ch op)
                      (handler (casync--make-handler
-                               :flag flag
-                               :fn (lambda (v) (funcall fret (list v ch)))
-                               :blockable (not has-default)))
+                               flag
+                               (lambda (v) (funcall fret (list v ch)))
+                               (not has-default)))
                      (box (casync--channel-take! ch handler t)))
                 (when box
                   (setq completed (list (casync--unbox box) ch))
@@ -615,9 +598,9 @@ OPTS may include `:default VALUE' and `:priority t'."
             (let* ((ch (car op))
                    (val (cadr op))
                    (handler (casync--make-handler
-                             :flag flag
-                             :fn (lambda (ret) (funcall fret (list ret ch)))
-                             :blockable (not has-default)))
+                             flag
+                             (lambda (ret) (funcall fret (list ret ch)))
+                             (not has-default)))
                    (box (casync--channel-put! ch val handler t)))
               (when box
                 (setq completed (list (casync--unbox box) ch))
@@ -744,6 +727,238 @@ Each clause is PORT followed by (BINDINGS BODY...), or `:default EXPR'."
           (setq casync--external-pending (1+ casync--external-pending))
           (casync--timeout-reschedule)
           ch))))
+
+
+(defun casync-reduced (value)
+  "Wrap VALUE to signal early termination of `casync-reduce'."
+  (list 'casync--reduced :value value))
+
+(defun casync-reduced-p (object)
+  "Return non-nil when OBJECT marks an early reduction result."
+  (eq (car-safe object) 'casync--reduced))
+
+(defun casync--reduced-value (object)
+  "Return the value wrapped by `casync-reduced' OBJECT."
+  (casync--get object :value))
+
+(cl-defun casync-onto-chan! (ch coll &optional (close t))
+  "Put each element of COLL on CH, then close CH unless CLOSE is nil.
+Return a channel that closes when the transfer finishes."
+  (casync-go
+    (dolist (x coll)
+      (casync->! ch x))
+    (when close
+      (casync-close! ch))))
+
+(defun casync-to-chan! (coll &optional buffer)
+  "Return a channel that delivers each element of COLL and then closes.
+BUFFER is passed to `casync-chan'."
+  (let ((ch (casync-chan buffer)))
+    (casync-onto-chan! ch coll t)
+    ch))
+
+(cl-defun casync-pipe (from to &optional (close t))
+  "Copy values from channel FROM to channel TO.
+Close TO when FROM closes unless CLOSE is nil.  Return TO."
+  (casync-go-loop ()
+    (let ((v (casync-<! from)))
+      (if (null v)
+          (when close (casync-close! to))
+        (casync->! to v)
+        (casync-recur))))
+  to)
+
+(defun casync-reduce (f init ch)
+  "Reduce values taken from CH with F starting at INIT.
+Return a channel delivering the final result.  A `casync-reduced'
+result stops the reduction early."
+  (casync-go-loop ((acc init))
+    (let ((v (casync-<! ch)))
+      (if (null v)
+          acc
+        (let ((acc2 (funcall f acc v)))
+          (if (casync-reduced-p acc2)
+              (casync--reduced-value acc2)
+            (casync-recur acc2)))))))
+
+(defun casync-into (coll ch)
+  "Collect all values from CH into COLL and return a channel with the result."
+  (casync-reduce (lambda (acc x) (append acc (list x))) coll ch))
+
+(cl-defun casync-take (n ch &optional buffer)
+  "Return a channel of the first N values from CH, then closed.
+BUFFER is passed to `casync-chan'."
+  (let ((out (casync-chan buffer)))
+    (casync-go-loop ((i 0))
+      (if (>= i n)
+          (casync-close! out)
+        (let ((v (casync-<! ch)))
+          (if (null v)
+              (casync-close! out)
+            (casync->! out v)
+            (casync-recur (1+ i))))))
+    out))
+
+(cl-defun casync-merge (chans &optional buffer)
+  "Return a channel that receives values from all CHANS until each closes.
+BUFFER is passed to `casync-chan'."
+  (let ((out (casync-chan buffer)))
+    (casync-go-loop ((cs chans))
+      (if (null cs)
+          (casync-close! out)
+        (let* ((res (casync-alts! cs))
+               (v (nth 0 res))
+               (ch (nth 1 res)))
+          (if (null v)
+              (casync-recur (cl-remove ch cs :test #'eq))
+            (casync->! out v)
+            (casync-recur cs)))))
+    out))
+
+(cl-defun casync-split (pred ch &optional true-buffer false-buffer)
+  "Split CH by PRED into two channels (TRUE-CH FALSE-CH).
+TRUE-BUFFER and FALSE-BUFFER are passed to `casync-chan'."
+  (let ((tc (casync-chan true-buffer))
+        (fc (casync-chan false-buffer)))
+    (casync-go-loop ()
+      (let ((v (casync-<! ch)))
+        (if (null v)
+            (progn (casync-close! tc) (casync-close! fc))
+          (casync->! (if (funcall pred v) tc fc) v)
+          (casync-recur))))
+    (list tc fc)))
+
+(cl-defun casync-unique (ch &optional buffer)
+  "Return a channel of values from CH with consecutive duplicates removed.
+BUFFER is passed to `casync-chan'."
+  (let ((out (casync-chan buffer)))
+    (casync-go-loop ((last 'casync--none))
+      (let ((v (casync-<! ch)))
+        (if (null v)
+            (casync-close! out)
+          (if (equal v last)
+              (casync-recur last)
+            (casync->! out v)
+            (casync-recur v)))))
+    out))
+
+(cl-defun casync-partition (n ch &optional buffer)
+  "Return a channel of consecutive groups of N values from CH.
+A trailing partial group is delivered.  BUFFER is passed to `casync-chan'."
+  (let ((out (casync-chan buffer)))
+    (casync-go-loop ((batch nil) (cnt 0))
+      (let ((v (casync-<! ch)))
+        (if (null v)
+            (progn
+              (when (> cnt 0) (casync->! out (nreverse batch)))
+              (casync-close! out))
+          (let ((b (cons v batch))
+                (c (1+ cnt)))
+            (if (>= c n)
+                (progn (casync->! out (nreverse b)) (casync-recur nil 0))
+              (casync-recur b c))))))
+    out))
+
+(cl-defun casync-partition-by (f ch &optional buffer)
+  "Return a channel of groups of values from CH split when (F value) changes.
+BUFFER is passed to `casync-chan'."
+  (let ((out (casync-chan buffer)))
+    (casync-go-loop ((batch nil) (last 'casync--none))
+      (let ((v (casync-<! ch)))
+        (if (null v)
+            (progn
+              (when batch (casync->! out (nreverse batch)))
+              (casync-close! out))
+          (let ((fv (funcall f v)))
+            (if (or (eq last 'casync--none) (equal fv last))
+                (casync-recur (cons v batch) fv)
+              (casync->! out (nreverse batch))
+              (casync-recur (list v) fv))))))
+    out))
+
+(defun casync-mult (ch)
+  "Return a mult that broadcasts every value of CH to its taps."
+  (let ((m (list 'casync--mult :ch ch :taps nil)))
+    (casync-go-loop ()
+      (let ((v (casync-<! ch)))
+        (if (null v)
+            (dolist (tap (casync--get m :taps))
+              (casync-close! (car tap)))
+          (dolist (tap (copy-sequence (casync--get m :taps)))
+            (casync->! (car tap) v))
+          (casync-recur))))
+    m))
+
+(cl-defun casync-tap (m ch &optional (close t))
+  "Add CH as a tap of mult M.  Close CH when M's source closes unless CLOSE."
+  (casync--set m :taps (cons (cons ch close) (casync--get m :taps)))
+  ch)
+
+(defun casync-untap (m ch)
+  "Remove CH from the taps of mult M.  Return M."
+  (casync--set m :taps
+               (cl-remove ch (casync--get m :taps) :key #'car :test #'eq))
+  m)
+
+(defun casync-mix (out)
+  "Return a mix that forwards values from its admixed inputs to OUT."
+  (let ((m (list 'casync--mix
+                 :out out
+                 :ins nil
+                 :change (casync-chan (casync-sliding-buffer 1)))))
+    (casync-go-loop ()
+      (let ((ins (casync--get m :ins)))
+        (if (null ins)
+            (progn (casync-<! (casync--get m :change)) (casync-recur))
+          (let* ((res (casync-alts! (cons (casync--get m :change) ins)))
+                 (v (nth 0 res))
+                 (ch (nth 1 res)))
+            (cond
+             ((eq ch (casync--get m :change)) (casync-recur))
+             ((null v)
+              (casync--set m :ins (cl-remove ch (casync--get m :ins) :test #'eq))
+              (casync-recur))
+             (t (casync->! (casync--get m :out) v) (casync-recur)))))))
+    m))
+
+(defun casync-admix (m ch)
+  "Add input channel CH to mix M.  Return M."
+  (casync--set m :ins (cons ch (casync--get m :ins)))
+  (casync-put! (casync--get m :change) t #'ignore)
+  m)
+
+(defun casync-unmix (m ch)
+  "Remove input channel CH from mix M.  Return M."
+  (casync--set m :ins (cl-remove ch (casync--get m :ins) :test #'eq))
+  (casync-put! (casync--get m :change) t #'ignore)
+  m)
+
+(defun casync-pub (ch topic-fn)
+  "Return a pub that routes values of CH by TOPIC-FN to subscribers."
+  (let ((p (list 'casync--pub
+                 :ch ch
+                 :topic-fn topic-fn
+                 :mults (make-hash-table :test 'equal))))
+    (casync-go-loop ()
+      (let ((v (casync-<! ch)))
+        (if (null v)
+            (maphash (lambda (_topic entry) (casync-close! (car entry)))
+                     (casync--get p :mults))
+          (let ((entry (gethash (funcall topic-fn v) (casync--get p :mults))))
+            (when entry
+              (casync->! (car entry) v))
+            (casync-recur)))))
+    p))
+
+(cl-defun casync-sub (p topic ch &optional (close t))
+  "Subscribe CH to TOPIC of pub P.  Close CH on source close unless CLOSE."
+  (let ((entry (gethash topic (casync--get p :mults))))
+    (unless entry
+      (let ((src (casync-chan)))
+        (setq entry (cons src (casync-mult src)))
+        (puthash topic entry (casync--get p :mults))))
+    (casync-tap (cdr entry) ch close)
+    ch))
 
 (provide 'casync)
 
