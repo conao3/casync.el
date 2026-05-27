@@ -394,6 +394,9 @@ When ENQUEUE is non-nil and the take cannot complete, park HANDLER."
             (casync--box nil))
            (enqueue
             (when (casync--handler-blockable handler)
+              (setf (casync-channel-takes ch)
+                    (cl-delete-if-not #'casync--handler-active-p
+                                      (casync-channel-takes ch)))
               (when (>= (length (casync-channel-takes ch)) casync--max-queue-size)
                 (error "casync: too many pending takes"))
               (setf (casync-channel-takes ch)
@@ -430,6 +433,9 @@ When ENQUEUE is non-nil and the put cannot complete, park HANDLER."
                 (casync--box t)))
              (enqueue
               (when (casync--handler-blockable handler)
+                (setf (casync-channel-puts ch)
+                      (cl-delete-if-not (lambda (p) (casync--handler-active-p (cdr p)))
+                                        (casync-channel-puts ch)))
                 (when (>= (length (casync-channel-puts ch)) casync--max-queue-size)
                   (error "casync: too many pending puts"))
                 (setf (casync-channel-puts ch)
@@ -517,6 +523,14 @@ Valid only inside the body of `casync-go'."
 Valid only inside the body of `casync-go'."
   `(iter-yield (list :put ,ch ,val)))
 
+(defmacro casync-alts! (ops &rest opts)
+  "Park the current go block until one of OPS completes.
+OPS evaluates to a list whose elements are channels (take operations)
+or (CHANNEL VALUE) lists (put operations).  OPTS may include
+`:default VALUE' and `:priority t'.  Return (VALUE PORT).
+Valid only inside the body of `casync-go'."
+  `(iter-yield (list :alts ,ops (list ,@opts))))
+
 (defmacro casync-go (&rest body)
   "Run BODY asynchronously as a go block.
 Return a channel that yields BODY's value and then closes."
@@ -559,7 +573,121 @@ Return a channel that yields BODY's value and then closes."
      (casync-take! ch (lambda (v) (casync--go-resume it result-ch v))))
     (`(:put ,ch ,val)
      (casync-put! ch val (lambda (ret) (casync--go-resume it result-ch ret))))
+    (`(:alts ,ops ,opts)
+     (casync--alts ops opts (lambda (result) (casync--go-resume it result-ch result))))
     (_ (error "casync: unknown park request %S" request))))
+
+
+(defun casync--shuffle (list)
+  "Return a new list with the elements of LIST in random order."
+  (let ((vec (vconcat list))
+        (n (length list)))
+    (dotimes (i n)
+      (let ((j (+ i (random (- n i)))))
+        (cl-rotatef (aref vec i) (aref vec j))))
+    (append vec nil)))
+
+(defun casync--alts (ops opts fret)
+  "Try alt operations OPS with OPTS, delivering (VALUE PORT) to FRET.
+OPS is a list of channels (take) or (CHANNEL VALUE) lists (put).
+OPTS may include `:default VALUE' and `:priority t'."
+  (let* ((has-default (plist-member opts :default))
+         (priority (plist-get opts :priority))
+         (flag (list t))
+         (n (length ops))
+         (order (if priority
+                    (number-sequence 0 (1- n))
+                  (casync--shuffle (number-sequence 0 (1- n)))))
+         (completed nil))
+    (catch 'casync--alts-done
+      (dolist (i order)
+        (let ((op (nth i ops)))
+          (if (casync-channel-p op)
+              (let* ((ch op)
+                     (handler (casync--make-handler
+                               :flag flag
+                               :fn (lambda (v) (funcall fret (list v ch)))
+                               :blockable (not has-default)))
+                     (box (casync--channel-take! ch handler t)))
+                (when box
+                  (setq completed (list (casync--unbox box) ch))
+                  (throw 'casync--alts-done nil)))
+            (let* ((ch (car op))
+                   (val (cadr op))
+                   (handler (casync--make-handler
+                             :flag flag
+                             :fn (lambda (ret) (funcall fret (list ret ch)))
+                             :blockable (not has-default)))
+                   (box (casync--channel-put! ch val handler t)))
+              (when box
+                (setq completed (list (casync--unbox box) ch))
+                (throw 'casync--alts-done nil)))))))
+    (cond
+     (completed
+      (casync--dispatch (lambda () (funcall fret completed))))
+     (has-default
+      (when (car flag)
+        (setcar flag nil)
+        (let ((default (plist-get opts :default)))
+          (casync--dispatch (lambda () (funcall fret (list default :default)))))))
+     (t nil))))
+
+(defun casync-alts!! (ops &rest opts)
+  "Try alt operations OPS with OPTS, pumping until one completes.
+Return (VALUE PORT)."
+  (let ((got nil) (result nil))
+    (casync--alts ops opts (lambda (r) (setq result r got t)))
+    (casync--pump (lambda () got))
+    result))
+
+(defun casync--build-alt (alts-fn clauses)
+  "Build an alt form invoking ALTS-FN over CLAUSES.
+Each clause is a port followed by an action (BINDINGS BODY...), or
+the pair `:default DEFAULT'."
+  (let ((val-sym (gensym "casync--alt-val-"))
+        (port-sym (gensym "casync--alt-port-"))
+        (res-sym (gensym "casync--alt-res-"))
+        (bindings nil)
+        (ports nil)
+        (conds nil)
+        (has-default nil)
+        (default-form nil)
+        (rest clauses))
+    (while rest
+      (let ((head (pop rest))
+            (action (pop rest)))
+        (if (eq head :default)
+            (setq has-default t
+                  default-form action)
+          (let ((psym (gensym "casync--alt-p-")))
+            (push (list psym head) bindings)
+            (push psym ports)
+            (let ((vvar (nth 0 (car action)))
+                  (cvar (nth 1 (car action)))
+                  (body (cdr action)))
+              (push `((eq ,port-sym ,psym)
+                      (let (,@(when vvar `((,vvar ,val-sym)))
+                            ,@(when cvar `((,cvar ,port-sym))))
+                        ,@body))
+                    conds))))))
+    `(let* (,@(nreverse bindings)
+            (,res-sym (,alts-fn (list ,@(nreverse ports))
+                                ,@(when has-default (list :default default-form))))
+            (,val-sym (nth 0 ,res-sym))
+            (,port-sym (nth 1 ,res-sym)))
+       (cond ,@(nreverse conds)
+             ,@(when has-default
+                 `(((eq ,port-sym :default) ,val-sym)))))))
+
+(defmacro casync-alt! (&rest clauses)
+  "Select among CLAUSES inside a go block.
+Each clause is PORT followed by (BINDINGS BODY...), or `:default EXPR'."
+  (casync--build-alt 'casync-alts! clauses))
+
+(defmacro casync-alt!! (&rest clauses)
+  "Select among CLAUSES, pumping the scheduler until one completes.
+Each clause is PORT followed by (BINDINGS BODY...), or `:default EXPR'."
+  (casync--build-alt 'casync-alts!! clauses))
 
 (provide 'casync)
 

@@ -309,6 +309,60 @@ expands correctly, and with a fresh scheduler state."
     (casync-<!! c)))
 
 
+(defun casync-test--ident (v)
+  "Return a fresh channel already holding value V."
+  (let ((c (casync-chan 1)))
+    (casync-put! c v #'ignore)
+    c))
+
+(casync-deftest-thunk casync-alts/take := 42
+  (let ((c (casync-chan 1)))
+    (casync->!! c 42)
+    (nth 0 (casync-<!! (casync-go (casync-alts! (list c)))))))
+
+(casync-deftest-thunk casync-alts/returns-port :eq t
+  (let ((c (casync-chan 1)))
+    (casync->!! c 42)
+    (let ((res (casync-<!! (casync-go (casync-alts! (list c))))))
+      (eq (nth 1 res) c))))
+
+(casync-deftest-thunk casync-alts/default :equal '(42 :default)
+  (casync-<!! (casync-go (casync-alts! (list (casync-chan 1)) :default 42))))
+
+(casync-deftest-thunk casync-alts/random-checks-all :eq t
+  (let ((seen (casync-<!! (casync-go
+                           (let ((acc nil) (i 0))
+                             (while (< i 30)
+                               (let ((r (casync-alts!
+                                         (list (casync-test--ident :one)
+                                               (casync-test--ident :two)
+                                               (casync-test--ident :three)))))
+                                 (push (nth 0 r) acc))
+                               (setq i (1+ i)))
+                             acc)))))
+    (and (memq :one seen) (memq :two seen) (memq :three seen) t)))
+
+(casync-deftest-thunk casync-alts/put-on-closed-no-error :eq :ok
+  (let ((open (casync-chan)) (closed (casync-chan)))
+    (casync-close! closed)
+    (dotimes (_ 1500)
+      (casync-alts!! (list open (list closed t)) :priority t))
+    :ok))
+
+(cort-deftest casync-alts/put-nil-invalid
+  '((:cort-error error
+     (casync-test-fresh
+      (casync-alts!! (list (casync-chan) (list (casync-chan) nil)))))))
+
+(casync-deftest-thunk casync-alt/take-clause :equal '(42 :foo)
+  (let ((c (casync-chan 1)))
+    (casync->!! c 42)
+    (casync-<!! (casync-go (casync-alt! c ((v) (list v :foo)))))))
+
+(casync-deftest-thunk casync-alt/default := 42
+  (casync-<!! (casync-go (casync-alt! (casync-chan) ((v) :failed) :default 42))))
+
+
 (cort-deftest casync-go/park-outside-go-errors
   '((:cort-error error
      (casync-<! (casync-chan)))))
